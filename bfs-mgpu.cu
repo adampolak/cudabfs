@@ -10,14 +10,14 @@ using namespace mgpu;
 #include <cstdio>
 using namespace std;
 
-__global__ void UpdateDistanceAndParentKernel(
+__global__ void UpdateDistanceAndVisitedKernel(
     const int* __restrict__ frontier, int frontier_size, int d,
-    int* distance, int* parent) {
+    int* distance, int* visited) {
   int from = blockDim.x * blockIdx.x + threadIdx.x;
   int step = gridDim.x * blockDim.x;
   for (int i = from; i < frontier_size; i += step) {
     distance[frontier[i]] = d;
-    parent[frontier[i]] = -2;
+    atomicOr(visited + (frontier[i] >> 5), 1 << (frontier[i] & 31));
   }
 }
 
@@ -34,29 +34,33 @@ __global__ void CalculateFrontierStartsAndDegreesKernel(
 
 __global__ void AdvanceFrontierPhase1Kernel(
       const int* __restrict__ edge_frontier, int edge_frontier_size,
-      int* parent) {
+      const int* __restrict__ visited,
+      int* parent, int* edge_frontier_success) {
   int from = blockDim.x * blockIdx.x + threadIdx.x;
   int step = gridDim.x * blockDim.x;
   for (int i = from; i < edge_frontier_size; i += step) {
-    if (parent[edge_frontier[i]] == -1)
+    int v = edge_frontier[i];
+    int success = (((visited[v >> 5] >> (v & 31)) & 1) == 0 && parent[v] == -1) ? 1 : 0;
+    if (success)
       parent[edge_frontier[i]] = i;
+    edge_frontier_success[i] = success;
   }
 }
 
 __global__ void AdvanceFrontierPhase2Kernel(
       const int* __restrict__ edge_frontier, int edge_frontier_size,
-      const int* __restrict__ parent,
-      int* edge_frontier_success) {
+      const int* __restrict__ parent, int* edge_frontier_success) {
   int from = blockDim.x * blockIdx.x + threadIdx.x;
   int step = gridDim.x * blockDim.x;
-  for (int i = from; i < edge_frontier_size; i += step) {
-    edge_frontier_success[i] = parent[edge_frontier[i]] == i ? 1 : 0;
-  }
+  for (int i = from; i < edge_frontier_size; i += step)
+    if (edge_frontier_success[i] && parent[edge_frontier[i]] != i)
+      edge_frontier_success[i] = 0;
 }
 
 void ParallelBFS(
     int n, int m, MGPU_MEM(int) nodes, MGPU_MEM(int) edges, int source,
     MGPU_MEM(int) distance, CudaContext& context) {
+  MGPU_MEM(int) visited = context.Fill((n + 31) / 32, 0);
   MGPU_MEM(int) parent = context.Fill(n, -1);
   MGPU_MEM(int) node_frontier = context.Malloc<int>(n);
   MGPU_MEM(int) node_frontier_starts = context.Malloc<int>(n);  
@@ -68,9 +72,9 @@ void ParallelBFS(
   for (int d = 0; node_frontier_size > 0; ++d) {
     // cerr << "d = " << d << " frontier_size = " << node_frontier_size << endl;
     // PrintArray(*node_frontier, "%d", 10);
-    UpdateDistanceAndParentKernel<<<128, 128, 0, context.Stream()>>>(
+    UpdateDistanceAndVisitedKernel<<<128, 128, 0, context.Stream()>>>(
         node_frontier->get(), node_frontier_size, d,
-        distance->get(), parent->get());
+        distance->get(), visited->get());
     CalculateFrontierStartsAndDegreesKernel<<<128, 128, 0, context.Stream()>>>(
         nodes->get(), node_frontier->get(), node_frontier_size,
         node_frontier_starts->get(), node_frontier_degrees->get());
@@ -83,11 +87,11 @@ void ParallelBFS(
         node_frontier_degrees->get(), node_frontier_size, edges->get(),
         edge_frontier->get(), context);
     AdvanceFrontierPhase1Kernel<<<128, 128, 0, context.Stream()>>>(
-        edge_frontier->get(), edge_frontier_size,
-        parent->get());
+        edge_frontier->get(), edge_frontier_size, visited->get(),
+        parent->get(), edge_frontier_success->get());
     AdvanceFrontierPhase2Kernel<<<128, 128, 0, context.Stream()>>>(
-        edge_frontier->get(), edge_frontier_size, parent->get(),
-        edge_frontier_success->get());
+        edge_frontier->get(), edge_frontier_size,
+        parent->get(), edge_frontier_success->get());
     ScanExc(
         edge_frontier_success->get(), edge_frontier_size,
         &node_frontier_size, context);
